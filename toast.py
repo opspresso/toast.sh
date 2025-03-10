@@ -1,156 +1,81 @@
 #!/usr/bin/env python3
 
 import click
-import subprocess
+import importlib
+import inspect
 import os
+import pkgutil
+import sys
+from typing import List, Type
 
-def run_am():
+from plugins.base_plugin import BasePlugin
+
+def discover_and_load_plugins(plugins_package_name: str = "plugins") -> List[Type[BasePlugin]]:
+    """
+    Dynamically discover and load all plugin classes from the plugins package.
+
+    Args:
+        plugins_package_name: Name of the plugins package to search
+
+    Returns:
+        List of plugin classes that extend BasePlugin
+    """
+    discovered_plugins = []
+
     try:
-        result = subprocess.run(["aws", "sts", "get-caller-identity"], capture_output=True, text=True)
-        if result.returncode == 0:
-            formatted_json = subprocess.run(["jq", "-C", "."], input=result.stdout, capture_output=True, text=True)
-            click.echo(formatted_json.stdout)
-        else:
-            click.echo("Error fetching AWS caller identity.")
-    except Exception as e:
-        click.echo(f"Error fetching AWS caller identity: {e}")
+        # Import the plugins package
+        plugins_package = importlib.import_module(plugins_package_name)
+        plugins_path = os.path.dirname(plugins_package.__file__)
 
-def run_cdw():
-    workspace_dir = os.path.expanduser("~/workspace")
-    if not os.path.exists(workspace_dir):
-        os.makedirs(workspace_dir)
+        # Discover all modules in the plugins package
+        for _, name, is_pkg in pkgutil.iter_modules([plugins_path]):
+            # Skip the base_plugin module and __init__.py
+            if name == "base_plugin" or name == "__init__" or name == "utils":
+                continue
 
-    result = subprocess.run(["find", workspace_dir, "-mindepth", "1", "-maxdepth", "2", "-type", "d"], capture_output=True, text=True)
-    directories = sorted(result.stdout.splitlines())
+            # Import the module
+            module_name = f"{plugins_package_name}.{name}"
+            try:
+                module = importlib.import_module(module_name)
 
-    if not directories:
-        click.echo("No directories found in ~/workspace.")
-        return
+                # Find all classes in the module that are subclasses of BasePlugin
+                for item_name, item in inspect.getmembers(module, inspect.isclass):
+                    if (issubclass(item, BasePlugin) and
+                        item is not BasePlugin and
+                        item.__module__ == module_name):
+                        discovered_plugins.append(item)
+            except ImportError as e:
+                click.echo(f"Error loading plugin module {module_name}: {e}", err=True)
 
-    selected_dir = select_from_list(directories, "Select a directory")
+    except ImportError as e:
+        click.echo(f"Error loading plugins package {plugins_package_name}: {e}", err=True)
 
-    if selected_dir:
-        click.echo(selected_dir)
-    else:
-        click.echo("No directory selected.", err=True)
-
-def run_ctx():
-    result = subprocess.run(["kubectl", "config", "get-contexts", "-o=name"], capture_output=True, text=True)
-    if result.returncode != 0:
-        click.echo("Error fetching Kubernetes contexts. Is kubectl configured correctly?")
-        return
-
-    contexts = sorted(result.stdout.splitlines())
-    contexts.append("[New...]")
-    if len(contexts) > 1:
-        contexts.append("[Del...]")
-
-    selected_ctx = select_from_list(contexts, "Select a Kubernetes context")
-
-    if selected_ctx == "[New...]":
-        result = subprocess.run(["aws", "eks", "list-clusters", "--query", "clusters", "--output", "text"], capture_output=True, text=True)
-        if result.returncode != 0:
-            click.echo("Error fetching EKS clusters.")
-            return
-
-        clusters = sorted(result.stdout.split())
-        if not clusters:
-            click.echo("No EKS clusters found.")
-            return
-
-        selected_cluster = select_from_list(clusters, "Select an EKS cluster")
-
-        if selected_cluster:
-            subprocess.run(["aws", "eks", "update-kubeconfig", "--name", selected_cluster, "--alias", selected_cluster])
-            click.echo(f"Updated kubeconfig for {selected_cluster}")
-        else:
-            click.echo("No cluster selected.")
-    elif selected_ctx == "[Del...]":
-        delete_contexts = [ctx for ctx in contexts if ctx not in ("[New...]", "[Del...]")]
-        delete_contexts.append("[All...]")
-        selected_to_delete = select_from_list(delete_contexts, "Select a context to delete")
-        if selected_to_delete == "[All...]":
-            subprocess.run(["kubectl", "config", "unset", "contexts"])
-            click.echo("Deleted all Kubernetes contexts.")
-        elif selected_to_delete:
-            subprocess.run(["kubectl", "config", "delete-context", selected_to_delete])
-            click.echo(f"Deleted Kubernetes context: {selected_to_delete}")
-        else:
-            click.echo("No context selected for deletion.")
-    elif selected_ctx:
-        subprocess.run(["kubectl", "config", "use-context", selected_ctx])
-        click.echo(f"Switched to Kubernetes context: {selected_ctx}")
-    else:
-        click.echo("No context selected.")
-
-def run_env(env_name):
-    click.echo(f"Setting environment to {env_name}")
-
-def select_from_list(options, prompt="Select an option"):
-    try:
-        fzf_proc = subprocess.run(["fzf", "--height=15", "--reverse", "--border", "--prompt", prompt+": "], input="\n".join(options), capture_output=True, text=True)
-        return fzf_proc.stdout.strip()
-    except Exception as e:
-        click.echo(f"Error selecting from list: {e}")
-        return None
-
-def run_region():
-    try:
-        result = subprocess.run(["aws", "ec2", "describe-regions", "--query", "Regions[].RegionName", "--output", "text"], capture_output=True, text=True)
-        regions = sorted(result.stdout.split())
-        if not regions:
-            click.echo("No regions found.")
-            return
-
-        selected_region = select_from_list(regions, "Select AWS Region")
-
-        if selected_region:
-            subprocess.run(["aws", "configure", "set", "default.region", selected_region])
-            subprocess.run(["aws", "configure", "set", "default.output", "json"])
-            click.echo(f"Set AWS region to {selected_region}")
-        else:
-            click.echo("No region selected.")
-    except Exception as e:
-        click.echo(f"Error fetching AWS regions: {e}")
-
-def run_ssm():
-    click.echo("Running SSM command")
-
-def run_update():
-    click.echo("Updating CLI tool")
+    return discovered_plugins
 
 @click.group()
 def toast():
+    """
+    Toast command-line tool with dynamically loaded plugins.
+    """
     pass
 
-@toast.command()
-def am():
-    run_am()
+def main():
+    # Discover and load all plugins
+    plugins = discover_and_load_plugins()
 
-@toast.command()
-def cdw():
-    run_cdw()
+    if not plugins:
+        click.echo("No plugins were discovered", err=True)
+        sys.exit(1)
 
-@toast.command()
-@click.argument('env_name')
-def env(env_name):
-    run_env(env_name)
+    # Register each plugin with the CLI
+    for plugin_class in plugins:
+        try:
+            plugin_class.register(toast)
+        except Exception as e:
+            click.echo(f"Error registering plugin {plugin_class.__name__}: {e}", err=True)
 
-@toast.command()
-def region():
-    run_region()
-
-@toast.command()
-def ctx():
-    run_ctx()
-
-@toast.command()
-def ssm():
-    run_ssm()
-
-@toast.command()
-def update():
-    run_update()
+    # Run the CLI
+    toast()
 
 if __name__ == "__main__":
-    toast()
+    main()
